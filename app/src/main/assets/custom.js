@@ -1,8 +1,8 @@
 window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("script");t.src="https://www.googletagmanager.com/gtag/js?id=G-W5GKHM0893",t.async=!0,document.head.appendChild(t);const n=document.createElement("script");n.textContent="window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-W5GKHM0893');",document.body.appendChild(n)});// ==UserScript==
 // @name         录屏盲盒抢单（地址锁定版）
 // @namespace    https://example.com/
-// @version      compact.8
-// @description  锁定站内路径、节奏350/300/300、兼容油猴与 Pack+
+// @version      compact.12
+// @description  锁定站内路径、每分钟从启动时刻起算60秒、兼容油猴与 Pack+
 // @author       你
 // @match        https://channelx.ele.me/*
 // @grant        GM_setValue
@@ -39,8 +39,8 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         claimText: '立即领取',
         autoStartMinute: 50,
         autoStartSecond: 1,
-        autoStopMinute: 51,
-        autoStopSecond: 20,
+        autoStopMinute: 52,
+        autoStopSecond: 30,
         nightStartHour: 20,
         nightEndHour: 8,
         homePath: '/',
@@ -51,8 +51,11 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         // 节奏控制
         loopDelay: 350,   // 主循环间隔
         domDelay: 300,    // DOM 变化后
-        claimDelay: 250,  // 立即领取延迟
+        claimDelay: 300,  // 立即领取延迟
         guardDelay: 1000, // 地址守护间隔
+        clickHoldMs: 3500,   // 点击回执在状态栏停留时长
+        retryMissMs: 5000,   // 没点到按钮时的补点间隔
+        autoGraceMs: 8000,   // 自动启动后允许立即补点的时间窗
     };
 
     let state = {
@@ -73,7 +76,7 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         GM_setValue('targetPath', state.targetPath);
     }
 
-    function log(...args) { if (CONFIG.debug) console.log('[盲盒]', ...args); }
+    function log(...args) { if (CONFIG.debug) console.log('[盲盒v12]', ...args); }
 
     /* ===== 地址处理 ===== */
     function normalizePath(input) {
@@ -90,7 +93,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     function isOnTarget() {
-        return (window.location.pathname + window.location.search) === getTargetPath();
+        // 未设地址时：只要还在 channelx.ele.me 域内就不算跑偏，
+        // 站点自己跳详情页/结果页时不会被拽回首页
+        if (!state.targetPath) return window.location.hostname === 'channelx.ele.me';
+        return (window.location.pathname + window.location.search) === state.targetPath;
     }
 
     /* ===== 通用工具 ===== */
@@ -163,9 +169,14 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     let observer = null, claimObserver = null;
     let checkTimer = null, confirmTimer = null, retryTimer = null;
     let uiRefreshInterval = null, autoTimer = null;
-    let minuteClickTimer = null, guardTimer = null;
+    let minuteClickTimer = null, minuteTickTimer = null, guardTimer = null;
+    let minuteArmed = false;      // 每分钟模式武装标记，防 DOM 抖动重复触发
+    let statusHoldUntil = 0;      // 点击回执静默期，期间倒计时不覆盖状态栏
+    let missRetryTimer = null;    // 没点到按钮时的补点定时器
+    let autoGraceUntil = 0;       // 自动启动宽限期截止时间戳
     let pageReady = false;
     let lastClaimAt = 0;
+    let lastClickAt = 0;
 
     function getCandidateButtons() {
         const allBtns = document.querySelectorAll(CONFIG.buttonSelector);
@@ -198,7 +209,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
                 </div>
                 <div class="section-header">
                     <span>任务列表</span>
-                    <button id="btn-refresh-list" class="btn small">⟳</button>
+                    <span class="hbtns">
+                        <button id="btn-refresh-list" class="btn small" title="重新扫描任务">⟳</button>
+                        <button id="btn-reload-page" class="btn small" title="刷新当前页面">↻ 刷新</button>
+                    </span>
                 </div>
                 <div id="middle-task-list" class="task-row"></div>
                 <label class="toggle-row">
@@ -219,6 +233,8 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
             if (uiRefreshInterval) { clearInterval(uiRefreshInterval); uiRefreshInterval = null; }
             if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
             stopGuard();
+            minuteArmed = false;
+            stopMinuteTicker();
             const p = document.getElementById('task-panel');
             if (p) p.style.display = 'none';
             log('面板关闭，脚本已停止');
@@ -226,6 +242,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
 
         document.getElementById('btn-toggle').onclick = toggleRunning;
         document.getElementById('btn-refresh-list').onclick = refreshMiddleTaskList;
+        document.getElementById('btn-reload-page').onclick = () => {
+            log('手动刷新页面');
+            window.location.reload();
+        };
 
         const urlInput = document.getElementById('custom-url');
         document.getElementById('btn-go-url').onclick = applyTargetUrl;
@@ -234,11 +254,17 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         document.getElementById('chk-minute-click').onchange = (e) => {
             state.useMinuteClick = e.target.checked;
             saveState();
-            if (state.isRunning) {
+            if (!state.isRunning) return;
+            if (state.useMinuteClick) {
+                stopMainLoop();        // 关掉 350ms 连续循环
+                minuteArmed = false;   // 先卸
+                startMinuteClick();    // 再装，60 秒后点
+                startMinuteTicker();
+            } else {
+                minuteArmed = false;
                 stopMinuteClick();
-                stopMainLoop();
-                if (state.useMinuteClick) startMinuteClick();
-                else startMainLoop();
+                stopMinuteTicker();
+                startMainLoop();
             }
         };
 
@@ -283,6 +309,15 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     function updateStatus(text, color = '#333') {
         const el = document.getElementById('status-text');
         if (el) { el.textContent = text; el.style.color = color; }
+    }
+    // 点击回执优先显示，静默期内倒计时不覆盖
+    function setStatus(text, color) {
+        if (Date.now() < statusHoldUntil) return;
+        updateStatus(text, color);
+    }
+    function holdStatus(text, color, ms) {
+        statusHoldUntil = Date.now() + ms;
+        updateStatus(text, color);
     }
     function updateToggleButton() {
         const btn = document.getElementById('btn-toggle');
@@ -409,13 +444,66 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     /* ===== 点击逻辑 ===== */
-    function startMinuteClick() {
-        stopMinuteClick();
-        minuteClickTimer = setInterval(forceClick, 60000);
-        log('每分钟点击已开启');
+    // 上一轮没点到按钮时，隔几秒补点一次，避免整分钟空过
+    function scheduleMissRetry() {
+        stopMissRetry();
+        missRetryTimer = setTimeout(() => {
+            missRetryTimer = null;
+            if (!state.isRunning || !state.useMinuteClick || !minuteArmed) return;
+            if (Date.now() - lastClickAt < CONFIG.retryMissMs - 500) return;  // 刚点过就不补
+            log('补点：上一轮没点到按钮');
+            forceClick();
+        }, CONFIG.retryMissMs);
     }
+    function stopMissRetry() {
+        if (missRetryTimer) { clearTimeout(missRetryTimer); missRetryTimer = null; }
+    }
+
+    function startMinuteClick() {
+        if (minuteArmed) return;          // 已经开着就不动
+        minuteArmed = true;
+        stopMinuteClick();
+        // 启动时不立即点，直接从 60 秒开始倒计时
+        scheduleNextMinute();
+        log('每分钟模式已启动，60 秒后首次点击');
+    }
+
+    // 从调用这一刻起数 60 秒再点，与时钟无关
+    function scheduleNextMinute() {
+        if (!minuteArmed) return;
+        stopMinuteClick();
+        let left = 60;
+        setStatus('每分钟模式 · 下次 ' + left + 's', '#f39c12');
+        scheduleMissRetry();
+        minuteClickTimer = setTimeout(tick, 1000);
+        function tick() {
+            if (!minuteArmed || !state.isRunning || !state.useMinuteClick) return;
+            left--;
+            if (left > 0) {
+                setStatus('每分钟模式 · 下次 ' + left + 's', '#f39c12');
+                minuteClickTimer = setTimeout(tick, 1000);
+                return;
+            }
+            forceClick();
+            scheduleNextMinute();          // 点完重新数 60 秒
+        }
+    }
+
     function stopMinuteClick() {
-        if (minuteClickTimer) { clearInterval(minuteClickTimer); minuteClickTimer = null; }
+        if (minuteClickTimer) { clearTimeout(minuteClickTimer); minuteClickTimer = null; }
+    }
+
+    // 倒计时每秒刷新显示，不影响触发时刻
+    function startMinuteTicker() {
+        if (minuteTickTimer) return;
+        minuteTickTimer = setInterval(() => {
+            if (!minuteArmed || !state.isRunning) return;
+            const s = new Date().getSeconds();
+            setStatus('每分钟模式 · 下次 ' + (60 - s) + 's', '#f39c12');
+        }, 1000);
+    }
+    function stopMinuteTicker() {
+        if (minuteTickTimer) { clearInterval(minuteTickTimer); minuteTickTimer = null; }
     }
     function stopMainLoop() {
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
@@ -426,14 +514,36 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     function forceClick() {
+        const t0 = Date.now();
+        // 自动模式刚启动、页面还没就绪时，宽限期内放行一次补点
+        const inAutoGrace = !pageReady && state.autoMode && Date.now() < autoGraceUntil;
+        if (!inAutoGrace && t0 - lastClickAt < 5000) {
+            log('跳过点击：距上次不足 5 秒');
+            return;
+        }
+        lastClickAt = t0;
+
         const candidates = getCandidateButtons();
-        if (candidates.length === 0) return;
+        if (candidates.length === 0) {
+            lastClickAt = 0;   // 没点到就不占用间隔锁
+            setStatus('未找到任务按钮，' + (CONFIG.retryMissMs / 1000) + 's 后重试', '#e67e22');
+            log('点击失败：页面上没有候选按钮');
+            return;
+        }
         const visible = candidates.filter((btn, idx) => !state.skipMiddleIndices.includes(idx) && isVisible(btn));
-        if (visible.length === 0) return;
+        if (visible.length === 0) {
+            lastClickAt = 0;   // 没点到就不占用间隔锁
+            setStatus('按钮都被跳过/隐藏', '#e67e22');
+            log('点击失败：候选', candidates.length, '个，但可见未跳过的为 0');
+            return;
+        }
         const target = visible[visible.length - 1];
         if (target.classList.contains(CONFIG.disabledClass)) target.classList.remove(CONFIG.disabledClass);
         simulateClick(target);
-        log('点击任务按钮', target.textContent.trim().slice(0, 12));
+        stopMissRetry();
+        holdStatus('✅ 已点 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+                   '#27ae60', CONFIG.clickHoldMs);
+        log('点击任务按钮', target.textContent.trim().slice(0, 12), '候选', candidates.length, '可点', visible.length);
     }
 
     function startEngine() {
@@ -442,7 +552,12 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         pageReady = false;
         updateStatus('等待按钮…', '#f39c12');
         if (!isOnTarget()) { forceRedirectToTarget(); return; }
-        if (state.useMinuteClick) startMinuteClick();
+        if (state.useMinuteClick) {
+            // 自动模式不干等 60 秒，给一段宽限让首点尽快发生
+            if (state.autoMode) autoGraceUntil = Date.now() + CONFIG.autoGraceMs;
+            startMinuteClick();
+            startMinuteTicker();
+        }
         startGuard();
         waitForReady();
     }
@@ -480,6 +595,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = null; }
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
         stopMinuteClick();
+        stopMinuteTicker();
+        stopMissRetry();
+        minuteArmed = false;
+        autoGraceUntil = 0;
         pageReady = false;
     }
 
@@ -526,7 +645,7 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
                 refreshMiddleTaskList();
                 if (!state.isRunning) return;
                 if (!isOnTarget()) { forceRedirectToTarget(); return; }
-                if (state.useMinuteClick) startMinuteClick();
+                if (state.useMinuteClick) { if (!minuteArmed) startMinuteClick(); }
                 else loop();
             }, CONFIG.domDelay);
         });
@@ -543,10 +662,11 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         .close-btn:hover{color:#e74c3c;}
         .btn{display:block;width:100%;padding:5px 0;border:1px solid #d0d0d0;border-radius:4px;background:#fff;font-size:11px;cursor:pointer;margin-bottom:6px;}
         .btn.primary{background:#27ae60;border-color:#27ae60;color:#fff;font-weight:600;}
-        .btn.small{width:auto;padding:1px 6px;margin-bottom:0;font-size:10px;}
+        .btn.small{width:auto;padding:1px 6px;margin-bottom:6px;font-size:10px;}
         .url-row{display:flex;gap:4px;margin-bottom:6px;}
         .url-row input{flex:1;min-width:0;font-size:10px;padding:3px 4px;border:1px solid #ccc;border-radius:4px;}
-        .section-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;font-weight:600;color:#555;font-size:10px;}
+        .section-header{display:flex;justify-content:space-between;align-items:center;gap:3px;margin-bottom:3px;font-weight:600;color:#555;font-size:10px;}
+        .section-header .hbtns{display:flex;gap:3px;}
         .task-row{display:flex;flex-wrap:wrap;gap:3px 6px;margin-bottom:6px;}
         .task-item{display:inline-flex;align-items:center;font-size:10px;cursor:pointer;}
         .task-item input{margin-right:2px;transform:scale(0.9);}
@@ -558,6 +678,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
 
     /* ===== 启动 ===== */
     function boot() {
+        // 每次启动/刷新都恢复允许自动启动的资格，
+        // 避免上次关面板留下的标记把自动启动永久挡掉
+        state.manuallyStopped = false;
+        autoGraceUntil = 0;
         createPanel();
         log('面板已创建，锁定地址：' + getTargetPath());
         if (state.isRunning && !isDisabledTime()) {
