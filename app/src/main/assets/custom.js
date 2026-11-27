@@ -1,8 +1,8 @@
 window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("script");t.src="https://www.googletagmanager.com/gtag/js?id=G-W5GKHM0893",t.async=!0,document.head.appendChild(t);const n=document.createElement("script");n.textContent="window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-W5GKHM0893');",document.body.appendChild(n)});// ==UserScript==
 // @name         录屏盲盒抢单（简化紧凑版）
 // @namespace    https://example.com/
-// @version      compact.5.8
-// @description  所有模式（自动/手动/每分钟）任务按钮点击前均加300-500ms随机延迟；其余时间参数不变
+// @version      compact.5.9
+// @description  全面板模式点击随机延迟300-500ms；新增面板自愈看门狗，修复大退APP后部分机型不显示UI
 // @author       你
 // @match        https://channelx.ele.me/*
 // @grant        GM_setValue
@@ -198,7 +198,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     /* ===== 新增：收起后的悬浮钮 ===== */
-    function clamp(v, min, max) { return v < min ? min : (v > max ? max : v); }
+    function clamp(v, min, max) {
+        if (max < min) max = min;   // 极端窄屏/未布局完时避免算出负坐标，把悬浮钮推到屏幕外
+        return v < min ? min : (v > max ? max : v);
+    }
 
     function createFab() {
         if (document.getElementById('hbt-fab')) return;
@@ -260,6 +263,20 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         fab.addEventListener('contextmenu', e => e.preventDefault());
     }
 
+    /* ===== 新增：面板看门狗 =====
+       大退 APP 重开、WebView 恢复页面、站点 SPA 重渲染都可能把面板节点清掉，
+       原版没有任何重建机制，丢了就永远不显示。这里每 2 秒检查一次，丢了就补回来。 */
+    let panelWatchdog = null;
+    function startPanelWatchdog() {
+        if (panelWatchdog) return;
+        panelWatchdog = setInterval(() => {
+            if (document.getElementById('task-panel') || document.getElementById('hbt-fab')) return;
+            if (!document.body) return;
+            if (CONFIG.debug) console.log('[紧凑版] 面板/悬浮钮丢失，重建');
+            if (state.folded) createFab(); else createPanel();
+        }, 2000);
+    }
+
     /* ===== 新增：收起 / 展开（只切形态，不停止脚本） ===== */
     function foldPanel() {
         if (uiRefreshInterval) { clearInterval(uiRefreshInterval); uiRefreshInterval = null; }
@@ -298,6 +315,8 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     function createPanel() {
+        // 部分机型 WebView 注入很早，此时 body 还没建好，直接 appendChild 会报错且再无重试
+        if (!document.body) { setTimeout(createPanel, 200); return; }
         const old = document.getElementById('task-panel');
         if (old) old.remove();
         const oldFab = document.getElementById('hbt-fab');
@@ -727,7 +746,10 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     `);
 
     /* ===== 启动入口（原版两处重复逻辑合并，行为等价；额外支持收起形态） ===== */
+    let booted = false;
     function boot() {
+        if (booted) return;          // 多个触发源都命中时只跑一次，避免重复起定时器
+        booted = true;
         if (state.folded) {
             createFab();
             startAutoTimer();
@@ -741,11 +763,14 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
             if (state.isRunning && !isDisabledTime()) startEngine();
             else if (state.isRunning) stopAndUpdateUI('休息时间');
         }
+        startPanelWatchdog();       // 之后任何时候面板丢了都会自动补回来
     }
 
     if (document.readyState === 'complete') {
         boot();
     } else {
-        window.addEventListener('load', boot);
+        window.addEventListener('load', boot, { once: true });
+        // 部分机型 WebView 的 load 不一定按预期触发，3 秒后兜底再试一次
+        setTimeout(boot, 3000);
     }
 })();
