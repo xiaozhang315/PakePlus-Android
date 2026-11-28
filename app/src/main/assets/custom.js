@@ -1,10 +1,15 @@
 window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("script");t.src="https://www.googletagmanager.com/gtag/js?id=G-W5GKHM0893",t.async=!0,document.head.appendChild(t);const n=document.createElement("script");n.textContent="window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-W5GKHM0893');",document.body.appendChild(n)});// ==UserScript==
 // @name         录屏盲盒抢单（简化紧凑版）
 // @namespace    https://example.com/
-// @version      compact.5.9
-// @description  全面板模式点击随机延迟300-500ms；新增面板自愈看门狗，修复大退APP后部分机型不显示UI
+// @version      compact.6.1
+// @description  全网页适配：任意页面都注入并显示面板；启动不依赖load，document-start不崩，面板自愈
 // @author       你
-// @match        https://channelx.ele.me/*
+// 注意：@match 只对油猴管理器有效，Pack plus 不读它。
+//       Pack plus 侧必须把「注入范围」设为 所有页面 / 全局（*），注入时机设为 页面创建时 / 最早，
+//       否则冷启动先落到空白页、登录页、中间跳转页时脚本不会执行，改这里的 @match 也没用。
+//       非 channelx 页面上：面板照常显示，但不会去找任务按钮、也不会把页面跳回首页。
+// @match        *://*/*
+// @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
@@ -40,10 +45,18 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         }
         function _gmStyle(css) {
             if (realStyle) { try { return realStyle(css); } catch (e) {} }
-            const s = document.createElement('style');
-            s.textContent = css;
-            (document.head || document.documentElement).appendChild(s);
-            return s;
+            // 部分机型在页面刚创建时就注入，此时 head / documentElement 都还是 null，
+            // 旧版直接 appendChild 会抛错，整个脚本当场死掉（表现就是「没有 UI」）。
+            // 改成等挂载点出现再插，保证脚本先活下来，面板由 boot/看门狗补建。
+            function mount() {
+                const host = document.head || document.documentElement;
+                if (!host) { setTimeout(mount, 50); return; }
+                const s = document.createElement('style');
+                s.textContent = css;
+                host.appendChild(s);
+            }
+            mount();
+            return null;
         }
 
         GM_getValue = _gmGet;
@@ -133,6 +146,8 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     function forceRedirectToHome() {
+        // 全网页适配后：只在 channelx 域内做首页回跳，别的网站一概不碰
+        if (window.location.hostname !== 'channelx.ele.me') return;
         if (!window.location.pathname.startsWith(CONFIG.myJueJinPath)) return;
         if (clickHomeViaReact()) return;
         const homeBtn = document.querySelector('div.adm-tab-bar-item:first-child');
@@ -178,7 +193,7 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     function manualReloadPage() {
         if (CONFIG.debug) console.log('[紧凑版] 手动刷新页面');
         try { window.location.reload(); }
-        catch (e) { window.location.href = CONFIG.homeUrl; }
+        catch (e) { window.location.href = window.location.href; }
     }
 
     function goCustomUrl() {
@@ -582,6 +597,8 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     }
 
     function forceClick() {
+        // 全网页适配：别的网站只挂面板、不点任何按钮，避免误触外部页面的元素
+        if (window.location.hostname !== 'channelx.ele.me') return;
         const candidates = getCandidateButtons();
         if (candidates.length === 0) return;
 
@@ -749,6 +766,9 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     let booted = false;
     function boot() {
         if (booted) return;          // 多个触发源都命中时只跑一次，避免重复起定时器
+        // 注入极早时 documentElement 可能还没建好，先等它出现再往下走，
+        // 否则后面所有 DOM 操作都会静默失败
+        if (!document.documentElement) { setTimeout(boot, 50); return; }
         booted = true;
         if (state.folded) {
             createFab();
@@ -766,11 +786,11 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         startPanelWatchdog();       // 之后任何时候面板丢了都会自动补回来
     }
 
-    if (document.readyState === 'complete') {
-        boot();
-    } else {
-        window.addEventListener('load', boot, { once: true });
-        // 部分机型 WebView 的 load 不一定按预期触发，3 秒后兜底再试一次
-        setTimeout(boot, 3000);
-    }
+    // 不再只等 load：立刻试一次，再挂多个触发源。
+    // 部分机型 WebView 的 load / DOMContentLoaded 不按预期触发，冷启动就会一直不 boot。
+    boot();
+    window.addEventListener('DOMContentLoaded', boot, { once: true });
+    window.addEventListener('load', boot, { once: true });
+    setTimeout(boot, 1000);
+    setTimeout(boot, 3000);
 })();
